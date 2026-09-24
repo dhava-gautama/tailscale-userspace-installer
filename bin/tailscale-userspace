@@ -1,0 +1,491 @@
+#!/bin/sh
+#
+# tailscale-userspace — run and control a rootless, userspace-mode tailscaled.
+#
+# Installed by install.sh. Configuration lives in
+# $XDG_CONFIG_HOME/tailscale-userspace/config; every path below comes from it.
+
+set -eu
+
+PROG="tailscale-userspace"
+UNIT_NAME="tailscaled-userspace.service"
+
+die() { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
+warn() { printf '%s: warning: %s\n' "$PROG" "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+: "${HOME:?HOME is not set}"
+
+MANAGER_PATH="$0"
+case "$MANAGER_PATH" in
+	/*) ;;
+	*)
+		manager_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || manager_dir="."
+		MANAGER_PATH="$manager_dir/$(basename -- "$0")"
+		;;
+esac
+
+CONFIG_DIR="${TSU_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/tailscale-userspace}"
+CONFIG_FILE="$CONFIG_DIR/config"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+UNIT_FILE="$UNIT_DIR/$UNIT_NAME"
+
+usage() {
+	cat <<'EOF'
+Usage: tailscale-userspace <command> [args]
+
+Daemon:
+  start                 start the userspace daemon (uses a systemd user unit
+                        when a user systemd session is available)
+  stop                  stop the daemon
+  restart               stop, then start
+  status                daemon status, config, and `tailscale status`
+  logs [-f]             show the daemon log (journalctl or the log file)
+  is-running            exit 0 if the daemon is up, 1 if not
+
+Tailnet:
+  up [flags...]         start the daemon if needed, then `tailscale up`
+                        e.g. up --auth-key=tskey-auth-... --advertise-exit-node --ssh
+  down                  disconnect (keeps the node registered)
+  logout                disconnect and expire the node key
+
+Using the tailnet:
+  exec <args...>        run the real tailscale CLI against this daemon
+  env                   print the proxy environment exports
+  run <cmd...>          run a command with the proxy environment set
+  shell                 start a shell with the proxy environment set
+
+Housekeeping:
+  version               print versions and paths
+  uninstall [--purge]   remove the wrappers, binaries and systemd unit
+                        (--purge also deletes the state directory)
+
+  help                  this help
+EOF
+}
+
+load_config() {
+	if [ -f "$CONFIG_FILE" ]; then
+		# shellcheck source=/dev/null
+		. "$CONFIG_FILE"
+	fi
+	: "${TSU_PREFIX:=$HOME/.local}"
+	: "${TSU_STATE_DIR:=${XDG_STATE_HOME:-$HOME/.local/state}/tailscale-userspace}"
+	: "${TSU_SOCKET:=$TSU_STATE_DIR/tailscaled.sock}"
+	: "${TSU_LOG:=$TSU_STATE_DIR/tailscaled.log}"
+	: "${TSU_PID_FILE:=$TSU_STATE_DIR/tailscaled.pid}"
+	: "${TSU_VERSION_FILE:=$TSU_STATE_DIR/running-version}"
+	: "${TSU_SOCKS5:=127.0.0.1:1055}"
+	: "${TSU_HTTP_PROXY:=$TSU_SOCKS5}"
+	: "${TSU_BIN_DIR:=}"
+	: "${TSU_VERSION:=unknown}"
+	: "${TSU_USE_SYSTEMD:=auto}"
+
+	[ -n "$TSU_BIN_DIR" ] || die "not installed yet: run install.sh"
+	[ -x "$TSU_BIN_DIR/tailscaled" ] || die "missing $TSU_BIN_DIR/tailscaled (re-run install.sh)"
+}
+
+daemon_args() {
+	printf '%s\n' --tun=userspace-networking
+	printf '%s\n' "--socket=$TSU_SOCKET"
+	printf '%s\n' "--statedir=$TSU_STATE_DIR"
+	if [ -n "$TSU_SOCKS5" ]; then
+		printf '%s\n' "--socks5-server=$TSU_SOCKS5"
+	fi
+	if [ -n "$TSU_HTTP_PROXY" ]; then
+		printf '%s\n' "--outbound-http-proxy-listen=$TSU_HTTP_PROXY"
+	fi
+}
+
+launch_daemon() { # fg | bg
+	mode="$1"
+	set --
+	while IFS= read -r daemon_arg; do
+		[ -n "$daemon_arg" ] || continue
+		set -- "$@" "$daemon_arg"
+	done <<EOF
+$(daemon_args)
+EOF
+
+	if [ "$mode" = fg ]; then
+		exec "$TSU_BIN_DIR/tailscaled" "$@"
+	fi
+
+	mkdir -p "$TSU_STATE_DIR"
+	chmod 700 "$TSU_STATE_DIR" 2>/dev/null || true
+	if have setsid; then
+		setsid "$TSU_BIN_DIR/tailscaled" "$@" >>"$TSU_LOG" 2>&1 &
+	else
+		nohup "$TSU_BIN_DIR/tailscaled" "$@" >>"$TSU_LOG" 2>&1 &
+	fi
+	printf '%s\n' "$!" >"$TSU_PID_FILE"
+}
+
+systemd_ok() {
+	[ "$TSU_USE_SYSTEMD" != no ] || return 1
+	have systemctl || return 1
+	[ -d /run/systemd/system ] || return 1
+	systemctl --user show-environment >/dev/null 2>&1 || return 1
+	return 0
+}
+
+install_unit() { # prints changed|unchanged
+	mkdir -p "$UNIT_DIR"
+	unit_tmp="$UNIT_DIR/.$UNIT_NAME.new.$$"
+	{
+		printf '[Unit]\n'
+		printf 'Description=Tailscale userspace daemon (rootless, no TUN)\n'
+		printf 'Documentation=https://github.com/dhava-gautama/tailscale-userspace-installer\n'
+		printf '\n[Service]\n'
+		printf 'Type=simple\n'
+		printf 'ExecStart=%s __daemon\n' "$MANAGER_PATH"
+		printf 'Restart=on-failure\n'
+		printf 'RestartSec=5\n'
+		printf '\n[Install]\n'
+		printf 'WantedBy=default.target\n'
+	} >"$unit_tmp"
+	if [ -f "$UNIT_FILE" ] && cmp -s "$unit_tmp" "$UNIT_FILE"; then
+		rm -f "$unit_tmp"
+		printf 'unchanged'
+		return 0
+	fi
+	mv -f "$unit_tmp" "$UNIT_FILE"
+	printf 'changed'
+}
+
+is_running() {
+	if systemd_ok && systemctl --user is-active --quiet "$UNIT_NAME"; then
+		return 0
+	fi
+	if [ -f "$TSU_PID_FILE" ] && [ -S "$TSU_SOCKET" ]; then
+		pid=$(cat "$TSU_PID_FILE" 2>/dev/null || true)
+		case "$pid" in
+			'' | *[!0-9]*) ;;
+			*) kill -0 "$pid" 2>/dev/null && return 0 ;;
+		esac
+	fi
+	return 1
+}
+
+pid_of() {
+	if systemd_ok && systemctl --user is-active --quiet "$UNIT_NAME"; then
+		systemctl --user show -p MainPID --value "$UNIT_NAME" 2>/dev/null || printf 'unknown'
+	elif [ -f "$TSU_PID_FILE" ]; then
+		cat "$TSU_PID_FILE" 2>/dev/null || printf 'unknown'
+	else
+		printf 'unknown'
+	fi
+}
+
+wait_for_socket() {
+	i=0
+	while [ "$i" -lt 30 ]; do
+		[ -S "$TSU_SOCKET" ] && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+stop_background() {
+	[ -f "$TSU_PID_FILE" ] || return 0
+	pid=$(cat "$TSU_PID_FILE" 2>/dev/null || true)
+	rm -f "$TSU_PID_FILE"
+	case "$pid" in
+		'' | *[!0-9]*) return 0 ;;
+	esac
+	kill -0 "$pid" 2>/dev/null || return 0
+	kill "$pid" 2>/dev/null || true
+	i=0
+	while [ "$i" -lt 10 ]; do
+		kill -0 "$pid" 2>/dev/null || return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	warn "daemon $pid did not stop, sending SIGKILL"
+	kill -9 "$pid" 2>/dev/null || true
+	return 0
+}
+
+cmd_start() {
+	load_config
+	mkdir -p "$TSU_STATE_DIR"
+	chmod 700 "$TSU_STATE_DIR" 2>/dev/null || true
+
+	if is_running; then
+		running_ver=$(cat "$TSU_VERSION_FILE" 2>/dev/null || true)
+		if [ "$running_ver" != "$TSU_VERSION" ]; then
+			printf 'Restarting the daemon to pick up Tailscale %s (was %s)\n' \
+				"$TSU_VERSION" "${running_ver:-unknown}"
+			cmd_stop >/dev/null
+		else
+			if systemd_ok; then
+				unit_state=$(install_unit)
+				if [ "$unit_state" = changed ]; then
+					systemctl --user daemon-reload
+					systemctl --user restart "$UNIT_NAME"
+					printf 'Daemon restarted with the new systemd unit.\n'
+				fi
+			fi
+			printf 'tailscaled is already running (pid %s, socket %s)\n' "$(pid_of)" "$TSU_SOCKET"
+			return 0
+		fi
+	fi
+
+	if systemd_ok; then
+		install_unit >/dev/null
+		systemctl --user daemon-reload
+		systemctl --user enable --now "$UNIT_NAME"
+	else
+		launch_daemon bg
+	fi
+
+	if wait_for_socket; then
+		printf '%s\n' "$TSU_VERSION" >"$TSU_VERSION_FILE"
+		printf 'tailscaled %s is up in userspace mode (socket %s)\n' "$TSU_VERSION" "$TSU_SOCKET"
+		if [ -n "$TSU_SOCKS5" ]; then
+			printf 'Proxy: SOCKS5 and HTTP on %s\n' "$TSU_SOCKS5"
+		fi
+		return 0
+	fi
+
+	warn "the daemon did not create $TSU_SOCKET within 30s"
+	cmd_logs_short >&2 || true
+	return 1
+}
+
+cmd_stop() {
+	load_config
+	if systemd_ok; then
+		systemctl --user stop "$UNIT_NAME" 2>/dev/null || true
+	fi
+	stop_background
+	if [ -S "$TSU_SOCKET" ]; then
+		warn "socket $TSU_SOCKET still exists; a tailscaled may still be running"
+	fi
+	printf 'tailscaled stopped.\n'
+}
+
+cmd_logs_short() {
+	if systemd_ok; then
+		journalctl --user -u "$UNIT_NAME" -n 20 --no-pager 2>/dev/null || true
+	elif [ -f "$TSU_LOG" ]; then
+		tail -n 20 "$TSU_LOG"
+	else
+		printf 'no log file at %s\n' "$TSU_LOG"
+	fi
+}
+
+cmd_logs() {
+	load_config
+	follow=no
+	[ "${1:-}" = "-f" ] && follow=yes
+	if systemd_ok; then
+		if [ "$follow" = yes ]; then
+			exec journalctl --user -u "$UNIT_NAME" -f
+		fi
+		exec journalctl --user -u "$UNIT_NAME" -n 100 --no-pager
+	fi
+	[ -f "$TSU_LOG" ] || die "no log file at $TSU_LOG"
+	if [ "$follow" = yes ]; then
+		exec tail -n 100 -f "$TSU_LOG"
+	fi
+	exec tail -n 100 "$TSU_LOG"
+}
+
+exec_ts() {
+	exec "$TSU_BIN_DIR/tailscale" --socket="$TSU_SOCKET" "$@"
+}
+
+cmd_status() {
+	load_config
+	if is_running; then
+		printf 'daemon:   running (pid %s)\n' "$(pid_of)"
+	else
+		printf 'daemon:   stopped\n'
+	fi
+	printf 'version:  %s\n' "$TSU_VERSION"
+	printf 'binaries: %s\n' "$TSU_BIN_DIR"
+	printf 'socket:   %s\n' "$TSU_SOCKET"
+	printf 'state:    %s\n' "$TSU_STATE_DIR"
+	printf 'socks5:   %s\n' "${TSU_SOCKS5:-disabled}"
+	printf 'http:     %s\n' "${TSU_HTTP_PROXY:-disabled}"
+	if systemd_ok; then
+		printf 'backend:  systemd user unit (%s)\n' "$UNIT_NAME"
+	else
+		printf 'backend:  background process (log: %s)\n' "$TSU_LOG"
+	fi
+	printf '\n'
+	if is_running; then
+		# `tailscale status` exits 1 when the node is logged out; the daemon
+		# itself is fine, so this command still succeeds.
+		"$TSU_BIN_DIR/tailscale" --socket="$TSU_SOCKET" status "$@" || true
+	fi
+	return 0
+}
+
+set_proxy_env() {
+	if [ -z "$TSU_SOCKS5" ]; then
+		warn "no SOCKS5 proxy configured; nothing exported"
+		return 0
+	fi
+	ALL_PROXY="socks5://$TSU_SOCKS5/"
+	all_proxy="$ALL_PROXY"
+	NO_PROXY="127.0.0.1,localhost,::1"
+	no_proxy="$NO_PROXY"
+	export ALL_PROXY all_proxy NO_PROXY no_proxy
+	if [ -n "$TSU_HTTP_PROXY" ]; then
+		HTTP_PROXY="http://$TSU_HTTP_PROXY/"
+		http_proxy="$HTTP_PROXY"
+		HTTPS_PROXY="$HTTP_PROXY"
+		https_proxy="$HTTP_PROXY"
+		export HTTP_PROXY http_proxy HTTPS_PROXY https_proxy
+	fi
+	return 0
+}
+
+cmd_env() {
+	load_config
+	if [ -z "$TSU_SOCKS5" ]; then
+		die "no SOCKS5 proxy configured"
+	fi
+	printf 'export ALL_PROXY=socks5://%s/\n' "$TSU_SOCKS5"
+	printf 'export all_proxy=socks5://%s/\n' "$TSU_SOCKS5"
+	if [ -n "$TSU_HTTP_PROXY" ]; then
+		printf 'export HTTP_PROXY=http://%s/\n' "$TSU_HTTP_PROXY"
+		printf 'export http_proxy=http://%s/\n' "$TSU_HTTP_PROXY"
+		printf 'export HTTPS_PROXY=http://%s/\n' "$TSU_HTTP_PROXY"
+		printf 'export https_proxy=http://%s/\n' "$TSU_HTTP_PROXY"
+	fi
+	printf 'export NO_PROXY=127.0.0.1,localhost,::1\n'
+	printf 'export no_proxy=127.0.0.1,localhost,::1\n'
+}
+
+cmd_uninstall() {
+	load_config
+	purge=no
+	[ "${1:-}" = "--purge" ] && purge=yes
+
+	if is_running; then
+		cmd_stop
+	fi
+	if have systemctl && [ -f "$UNIT_FILE" ]; then
+		systemctl --user disable --now "$UNIT_NAME" 2>/dev/null || true
+		rm -f "$UNIT_FILE"
+		systemctl --user daemon-reload 2>/dev/null || true
+		printf 'Removed %s\n' "$UNIT_FILE"
+	fi
+
+	for f in "$TSU_PREFIX/bin/tailscale" "$TSU_PREFIX/bin/tailscale-userspace"; do
+		if [ -e "$f" ]; then
+			rm -f "$f"
+			printf 'Removed %s\n' "$f"
+		fi
+	done
+	if [ -d "$TSU_PREFIX/libexec/tailscale-userspace" ]; then
+		rm -rf "$TSU_PREFIX/libexec/tailscale-userspace"
+		printf 'Removed %s\n' "$TSU_PREFIX/libexec/tailscale-userspace"
+	fi
+	if [ -f "$CONFIG_FILE" ]; then
+		rm -f "$CONFIG_FILE"
+		printf 'Removed %s\n' "$CONFIG_FILE"
+	fi
+
+	if [ "$purge" = yes ]; then
+		rm -rf "$TSU_STATE_DIR"
+		printf 'Removed %s (node key, state, logs)\n' "$TSU_STATE_DIR"
+		printf 'The machine may still be listed in the Tailscale admin console.\n'
+	else
+		printf 'Kept %s (use --purge to delete the node key and state)\n' "$TSU_STATE_DIR"
+	fi
+	printf 'Uninstalled.\n'
+}
+
+cmd_version() {
+	load_config
+	printf '%s\n' "$TSU_VERSION"
+	printf 'binaries: %s\n' "$TSU_BIN_DIR"
+	printf 'config:   %s\n' "$CONFIG_FILE"
+	if [ -x "$TSU_BIN_DIR/tailscale" ]; then
+		"$TSU_BIN_DIR/tailscale" --socket="$TSU_SOCKET" version 2>/dev/null || true
+	fi
+}
+
+cmd="${1:-help}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+	help | -h | --help) usage ;;
+	start) cmd_start ;;
+	stop) cmd_stop ;;
+	restart)
+		cmd_stop >/dev/null 2>&1 || true
+		cmd_start
+		;;
+	status) cmd_status "$@" ;;
+	logs) cmd_logs "$@" ;;
+	is-running)
+		load_config
+		is_running
+		;;
+	up)
+		load_config
+		cmd_start >/dev/null
+		# The tailscale CLI reads the auth key only from --auth-key; there is no
+		# TS_AUTHKEY environment variable. Translate the common TS_AUTHKEY=...
+		# habit into a key file, which also keeps the key out of `ps`.
+		if [ -n "${TS_AUTHKEY:-}" ]; then
+			has_key=no
+			for up_arg in "$@"; do
+				case "$up_arg" in
+					--auth-key | --auth-key=*) has_key=yes ;;
+				esac
+			done
+			if [ "$has_key" = no ]; then
+				key_file="$TSU_STATE_DIR/.authkey.$$"
+				(umask 077 && printf '%s' "$TS_AUTHKEY" >"$key_file")
+				set -- "$@" "--auth-key=file:$key_file"
+				rc=0
+				"$TSU_BIN_DIR/tailscale" --socket="$TSU_SOCKET" up "$@" || rc=$?
+				rm -f "$key_file"
+				exit "$rc"
+			fi
+		fi
+		exec_ts up "$@"
+		;;
+	down)
+		load_config
+		exec_ts down "$@"
+		;;
+	logout)
+		load_config
+		exec_ts logout "$@"
+		;;
+	exec)
+		load_config
+		exec_ts "$@"
+		;;
+	env) cmd_env ;;
+	run)
+		[ $# -ge 1 ] || die "run: no command given"
+		load_config
+		set_proxy_env
+		exec "$@"
+		;;
+	shell)
+		load_config
+		set_proxy_env
+		exec "${SHELL:-/bin/sh}"
+		;;
+	version) cmd_version ;;
+	uninstall) cmd_uninstall "$@" ;;
+	__daemon)
+		load_config
+		launch_daemon fg
+		;;
+	*)
+		printf '%s: unknown command: %s\n\n' "$PROG" "$cmd" >&2
+		usage >&2
+		exit 2
+		;;
+esac

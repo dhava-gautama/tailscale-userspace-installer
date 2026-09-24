@@ -1,0 +1,60 @@
+#!/bin/sh
+#
+# tailscale — drop-in wrapper for the Tailscale CLI that talks to the userspace
+# daemon installed by install.sh instead of a system-wide /var/run/tailscale.
+#
+# It behaves like the real CLI: arguments and exit codes are passed through.
+# The only extra thing it does is start the userspace daemon if it is not
+# running yet (set TSU_NO_AUTOSTART=1 to disable that).
+
+set -eu
+
+resolve_manager() {
+	if [ -n "${TSU_MANAGER:-}" ]; then
+		printf '%s' "$TSU_MANAGER"
+		return 0
+	fi
+
+	self="$0"
+	if command -v readlink >/dev/null 2>&1; then
+		resolved=$(readlink -f "$self" 2>/dev/null || true)
+		if [ -n "$resolved" ]; then
+			self="$resolved"
+		fi
+	fi
+	dir=$(CDPATH='' cd -- "$(dirname -- "$self")" 2>/dev/null && pwd) || dir=$(dirname -- "$self")
+
+	if [ -x "$dir/tailscale-userspace" ]; then
+		printf '%s' "$dir/tailscale-userspace"
+		return 0
+	fi
+	if command -v tailscale-userspace >/dev/null 2>&1; then
+		command -v tailscale-userspace
+		return 0
+	fi
+	printf '%s' "$dir/tailscale-userspace"
+}
+
+MANAGER=$(resolve_manager)
+[ -x "$MANAGER" ] || {
+	printf 'tailscale: error: cannot find tailscale-userspace next to %s\n' "$0" >&2
+	exit 1
+}
+
+# Commands that do not need a running daemon, and an explicit --socket, should
+# not pay for (or trigger) an auto-start.
+needs_daemon=yes
+case "${1:-}" in
+	version | --version | -v | help | --help | -h | '') needs_daemon=no ;;
+esac
+for arg in "$@"; do
+	case "$arg" in
+		--socket | --socket=*) needs_daemon=no ;;
+	esac
+done
+
+if [ "$needs_daemon" = yes ] && [ "${TSU_NO_AUTOSTART:-0}" != 1 ]; then
+	"$MANAGER" start >/dev/null 2>&1 || true
+fi
+
+exec "$MANAGER" exec "$@"
