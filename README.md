@@ -59,12 +59,32 @@ Nothing is written outside your home directory. No command uses `sudo`.
 | `--state-dir DIR` | state, socket and log directory (default `~/.local/state/tailscale-userspace`) |
 | `--version VER`, `--track stable\|unstable` | which Tailscale build to install |
 | `--arch ARCH` | override architecture detection |
-| `--socks5 ADDR`, `--http-proxy ADDR` | proxy listeners (default `127.0.0.1:1055`; pass `--socks5=` to disable) |
+| `--socks5 ADDR`, `--http-proxy ADDR` | proxy listeners as `host:port` (default `127.0.0.1:1055`; pass `--socks5=` to disable) |
 | `--auth-key KEY` | join the tailnet during install (also read from `$TS_AUTHKEY` or `$TS_AUTH_KEY`) |
 | `--shim` / `--no-shim` | install the `tailscale` wrapper (default: yes) |
 | `--systemd` / `--no-systemd` | use a systemd user unit when available (default: auto) |
 | `--linger` / `--no-linger` | try to enable systemd user lingering so the daemon starts at boot |
 | `--no-start`, `--no-up` | install only; do not start the daemon / do not join |
+
+`--prefix` and `--state-dir` must be absolute and free of whitespace or quotes. A
+`--socks5`/`--http-proxy` value must look like `host:port`, and is rejected before anything
+is downloaded otherwise.
+
+### Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `TS_AUTHKEY`, `TS_AUTH_KEY` | auth key for `install.sh`; `tailscale-userspace up` also honours `TS_AUTHKEY` |
+| `TSU_NO_AUTOSTART=1` | the `tailscale` wrapper will not start the daemon, it just execs the CLI |
+| `TSU_MANAGER` | manager path the wrapper calls instead of its sibling `tailscale-userspace` |
+| `TSU_CONFIG_DIR` | override the config directory (default `$XDG_CONFIG_HOME/tailscale-userspace`) |
+| `TSU_INSTALL_BASE_URL` | where `install.sh` fetches `bin/…` from (default: this repo's `main`) |
+| `TSU_PKGS_BASE` | where `install.sh` fetches Tailscale tarballs from (default `https://pkgs.tailscale.com`) |
+| `XDG_CONFIG_HOME`, `XDG_STATE_HOME` | standard XDG overrides for the config and state directories |
+
+`TS_AUTHKEY` is **not** a Tailscale CLI variable — the `tailscale` binary only reads
+`--auth-key`. Both scripts accept it as a convenience and rewrite it into a
+`--auth-key=file:…` reference, so the key never appears in `ps`.
 
 Any other flag is passed through to `tailscale up`, so `--ssh`,
 `--advertise-exit-node`, `--hostname=box`, `--advertise-tags=tag:ci` and friends all

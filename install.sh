@@ -39,8 +39,9 @@ Installer flags:
   --version VER       Tailscale version to install (default: latest on --track)
   --track TRACK       stable (default) or unstable
   --arch ARCH         override architecture detection (amd64, arm64, arm, 386, ...)
-  --socks5 ADDR       SOCKS5 listen address (default: 127.0.0.1:1055, empty to disable)
-  --http-proxy ADDR   HTTP proxy listen address (default: same as --socks5)
+  --socks5 ADDR       SOCKS5 listen address as host:port (default: 127.0.0.1:1055,
+                      empty to disable)
+  --http-proxy ADDR   HTTP proxy listen address as host:port (default: same as --socks5)
   --auth-key KEY      tailnet auth key; also read from $TS_AUTHKEY / $TS_AUTH_KEY
   --shim / --no-shim  install the `tailscale` wrapper that auto-starts the daemon
                       (default: install it)
@@ -380,13 +381,19 @@ if [ -f "$0" ] && [ -f "$(dirname "$0")/install.sh" ] && [ -d "$(dirname "$0")/b
 fi
 
 fetch_asset() { # repo path, destination, mode
+	asset_src=""
 	if [ -n "$LOCAL_DIR" ] && [ -f "$LOCAL_DIR/$1" ]; then
-		place_file "$LOCAL_DIR/$1" "$2" "$3"
+		asset_src="$LOCAL_DIR/$1"
 	else
 		fetch_url "$ASSET_BASE/$1" "$TMP_DIR/asset" ||
 			die "could not download $ASSET_BASE/$1"
-		place_file "$TMP_DIR/asset" "$2" "$3"
+		asset_src="$TMP_DIR/asset"
 	fi
+	# Leave an identical file alone, so a re-run touches nothing.
+	if [ -f "$2" ] && cmp -s "$asset_src" "$2"; then
+		return 0
+	fi
+	place_file "$asset_src" "$2" "$3"
 }
 
 fetch_asset "bin/tailscale-userspace" "$MANAGER" 0755
