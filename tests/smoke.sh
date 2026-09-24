@@ -99,8 +99,52 @@ check_not "TSU_NO_AUTOSTART=1 leaves the daemon down" "$MANAGER" is-running
 "$SHIM" status >/dev/null 2>&1 || true
 check "wrapper auto-starts the daemon" "$MANAGER" is-running
 
+printf '\n== wrapper fast path ==\n'
+# The per-command overhead that was removed is the manager process itself: when
+# the daemon is up the wrapper must not spawn it at all. TSU_MANAGER makes the
+# manager observable without touching the installed one.
+FAKE_LOG="$WORK/fake-manager.log"
+cat >"$WORK/fake-manager" <<EOS
+#!/bin/sh
+printf '%s\n' "\$*" >>"$FAKE_LOG"
+exit 0
+EOS
+chmod +x "$WORK/fake-manager"
+: >"$FAKE_LOG"
+
+TSU_MANAGER="$WORK/fake-manager" "$SHIM" status >/dev/null 2>&1 || true
+if [ -s "$FAKE_LOG" ]; then
+	bad "wrapper does not spawn the manager while the daemon is up (called: $(cat "$FAKE_LOG"))"
+else
+	ok "wrapper does not spawn the manager while the daemon is up"
+fi
+
+"$MANAGER" stop >/dev/null
+TSU_MANAGER="$WORK/fake-manager" "$SHIM" status >/dev/null 2>&1 || true
+if [ -s "$FAKE_LOG" ]; then
+	ok "wrapper spawns the manager when the daemon is down"
+else
+	bad "wrapper spawns the manager when the daemon is down"
+fi
+"$MANAGER" start >/dev/null
+check "daemon is back up for the remaining checks" "$MANAGER" is-running
+
+if command -v strace >/dev/null 2>&1; then
+	calls=$(strace -f -e trace=execve "$SHIM" version 2>&1 | grep -c 'execve(')
+	if [ "$calls" -le 2 ]; then
+		ok "wrapper costs $calls execve on the hot path (was 5)"
+	else
+		bad "wrapper costs $calls execve on the hot path (expected <= 2, was 5)"
+	fi
+else
+	printf 'skip execve count (strace not available)\n'
+fi
+
 printf '\n== idempotent re-run ==\n'
 pid_before=$(pgrep -f "socket=$STATE/tailscaled.sock" 2>/dev/null | head -n 1) || true
+# Replacing a file goes through a temp file and a rename, so a new inode means it
+# was rewritten. mtime is too coarse to tell within the same second.
+wrapper_inode_before=$(stat -c %i "$SHIM")
 if sh "$ROOT/install.sh" --prefix "$PREFIX" --state-dir "$STATE" --no-systemd \
 	--socks5=127.0.0.1:18055 >"$WORK/rerun.log" 2>&1; then
 	ok "re-run with the same version completed"
@@ -110,6 +154,9 @@ else
 fi
 check "re-run reused the installed binaries" grep -q "Reusing the existing Tailscale" "$WORK/rerun.log"
 check_not "re-run did not download the tarball" grep -q "Downloading" "$WORK/rerun.log"
+wrapper_inode_after=$(stat -c %i "$SHIM")
+check "re-run did not replace the identical wrapper" \
+	test "$wrapper_inode_before" = "$wrapper_inode_after"
 pid_after=$(pgrep -f "socket=$STATE/tailscaled.sock" 2>/dev/null | head -n 1) || true
 if [ -n "$pid_before" ] && [ "$pid_before" = "$pid_after" ]; then
 	ok "re-run left the running daemon alone (pid $pid_after)"
