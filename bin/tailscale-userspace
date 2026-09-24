@@ -121,12 +121,27 @@ EOF
 	printf '%s\n' "$!" >"$TSU_PID_FILE"
 }
 
+# Is a usable user systemd session present at all? No systemctl call.
+systemd_available() {
+	have systemctl && [ -d /run/systemd/system ]
+}
+
+# Whether this install should use systemd is asked several times per command,
+# so the expensive probe is memoized.
+TSU_SYSTEMD_CHECKED=no
+TSU_SYSTEMD_YES=no
 systemd_ok() {
-	[ "$TSU_USE_SYSTEMD" != no ] || return 1
-	have systemctl || return 1
-	[ -d /run/systemd/system ] || return 1
-	systemctl --user show-environment >/dev/null 2>&1 || return 1
-	return 0
+	if [ "$TSU_SYSTEMD_CHECKED" = yes ]; then
+		[ "$TSU_SYSTEMD_YES" = yes ]
+		return $?
+	fi
+	TSU_SYSTEMD_CHECKED=yes
+	TSU_SYSTEMD_YES=no
+	if [ "${TSU_USE_SYSTEMD:-auto}" != no ] && systemd_available &&
+		systemctl --user show-environment >/dev/null 2>&1; then
+		TSU_SYSTEMD_YES=yes
+	fi
+	[ "$TSU_SYSTEMD_YES" = yes ]
 }
 
 install_unit() { # prints changed|unchanged
@@ -157,29 +172,50 @@ is_running() {
 	if systemd_ok && systemctl --user is-active --quiet "$UNIT_NAME"; then
 		return 0
 	fi
-	if [ -f "$TSU_PID_FILE" ] && [ -S "$TSU_SOCKET" ]; then
-		pid=$(cat "$TSU_PID_FILE" 2>/dev/null || true)
-		case "$pid" in
-			'' | *[!0-9]*) ;;
-			*) kill -0 "$pid" 2>/dev/null && return 0 ;;
-		esac
+	pid=$(daemon_pid)
+	case "$pid" in
+		'' | *[!0-9]*) return 1 ;;
+	esac
+	[ -S "$TSU_SOCKET" ] || return 1
+	kill -0 "$pid" 2>/dev/null
+}
+
+# The pid of a background daemon, or empty. Uses the shell's own read, so no
+# cat and no subshell.
+daemon_pid() {
+	if [ -z "${TSU_PID_FILE:-}" ] || [ ! -f "$TSU_PID_FILE" ]; then
+		return 0
 	fi
-	return 1
+	pid=""
+	read -r pid <"$TSU_PID_FILE" 2>/dev/null || true
+	printf '%s' "$pid"
+}
+
+# Pids get recycled; only signal one that /proc says is really our daemon.
+pid_is_daemon() {
+	grep -qa tailscaled "/proc/$1/cmdline" 2>/dev/null
 }
 
 pid_of() {
-	if systemd_ok && systemctl --user is-active --quiet "$UNIT_NAME"; then
+	systemd_ok >/dev/null || true
+	if [ "$TSU_SYSTEMD_YES" = yes ]; then
 		systemctl --user show -p MainPID --value "$UNIT_NAME" 2>/dev/null || printf 'unknown'
-	elif [ -f "$TSU_PID_FILE" ]; then
-		cat "$TSU_PID_FILE" 2>/dev/null || printf 'unknown'
 	else
-		printf 'unknown'
+		pid=$(daemon_pid)
+		printf '%s' "${pid:-unknown}"
 	fi
 }
 
 wait_for_socket() {
+	# Poll quickly for the first two seconds, then once a second up to 30s.
 	i=0
-	while [ "$i" -lt 30 ]; do
+	while [ "$i" -lt 20 ]; do
+		[ -S "$TSU_SOCKET" ] && return 0
+		sleep 0.1 2>/dev/null || sleep 1
+		i=$((i + 1))
+	done
+	i=0
+	while [ "$i" -lt 28 ]; do
 		[ -S "$TSU_SOCKET" ] && return 0
 		sleep 1
 		i=$((i + 1))
@@ -188,13 +224,18 @@ wait_for_socket() {
 }
 
 stop_background() {
-	[ -f "$TSU_PID_FILE" ] || return 0
-	pid=$(cat "$TSU_PID_FILE" 2>/dev/null || true)
-	rm -f "$TSU_PID_FILE"
+	pid=$(daemon_pid)
+	if [ -n "${TSU_PID_FILE:-}" ] && [ -f "$TSU_PID_FILE" ]; then
+		rm -f "$TSU_PID_FILE"
+	fi
 	case "$pid" in
 		'' | *[!0-9]*) return 0 ;;
 	esac
 	kill -0 "$pid" 2>/dev/null || return 0
+	if ! pid_is_daemon "$pid"; then
+		warn "pid $pid in $TSU_PID_FILE is not a tailscaled process; not signalling it"
+		return 0
+	fi
 	kill "$pid" 2>/dev/null || true
 	i=0
 	while [ "$i" -lt 10 ]; do
@@ -233,6 +274,8 @@ cmd_start() {
 	fi
 
 	if systemd_ok; then
+		# A daemon left over from the background backend would hold the socket.
+		stop_background
 		install_unit >/dev/null
 		systemctl --user daemon-reload
 		systemctl --user enable --now "$UNIT_NAME"
@@ -256,7 +299,10 @@ cmd_start() {
 
 cmd_stop() {
 	load_config
-	if systemd_ok; then
+	# Stop the unit whenever it exists, not only when this install is configured
+	# to use systemd: a left-over unit would restart the daemon behind our back
+	# (Restart=on-failure) and fight for the socket.
+	if [ -f "$UNIT_FILE" ] && systemd_available; then
 		systemctl --user stop "$UNIT_NAME" 2>/dev/null || true
 	fi
 	stop_background
@@ -300,6 +346,11 @@ exec_ts() {
 cmd_status() {
 	load_config
 	if is_running; then
+		running=yes
+	else
+		running=no
+	fi
+	if [ "$running" = yes ]; then
 		printf 'daemon:   running (pid %s)\n' "$(pid_of)"
 	else
 		printf 'daemon:   stopped\n'
@@ -316,7 +367,7 @@ cmd_status() {
 		printf 'backend:  background process (log: %s)\n' "$TSU_LOG"
 	fi
 	printf '\n'
-	if is_running; then
+	if [ "$running" = yes ]; then
 		# `tailscale status` exits 1 when the node is logged out; the daemon
 		# itself is fine, so this command still succeeds.
 		"$TSU_BIN_DIR/tailscale" --socket="$TSU_SOCKET" status "$@" || true

@@ -136,6 +136,9 @@ Sources: [Userspace networking mode](https://tailscale.com/kb/1112/userspace-net
 Measured, not assumed (see `tests/smoke.sh`, run with the static 1.102.4 build):
 
 - install, checksum verification, daemon start/stop/restart, uninstall — all pass
+- a re-run with the same version reuses the installed binaries (no download) and leaves the
+  running daemon alone; a stale systemd unit is removed when switching to `--no-systemd`;
+  a malformed `--socks5` is rejected before anything is downloaded
 - `tailscale up --auth-key=... --advertise-exit-node --ssh` joins the tailnet and sets
   `RunSSH` plus `AdvertiseRoutes: 0.0.0.0/0, ::/0`
 - `tailscale ping <peer>` gets pongs over the userspace WireGuard stack
@@ -150,8 +153,10 @@ subnet-router traffic from a remote peer.
 
 ## Upgrading and uninstalling
 
-Re-run the same command (or `install.sh --version=1.104.0`): the new version is unpacked
-alongside the old one, the `current` symlink is repointed, and a running daemon is
+Re-run the same command (or `install.sh --version=1.104.0`). If that version is already on
+disk it is reused as-is — no 38 MB download — and if the daemon is already running with the
+same settings it is left alone, so live tailnet sessions survive a re-run. A new version is
+unpacked alongside the old one, the `current` symlink is repointed, and the daemon is
 restarted onto it. The previous version directory stays behind; delete it if you want.
 
 ```sh

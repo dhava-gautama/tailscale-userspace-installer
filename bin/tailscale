@@ -3,11 +3,17 @@
 # tailscale — drop-in wrapper for the Tailscale CLI that talks to the userspace
 # daemon installed by install.sh instead of a system-wide /var/run/tailscale.
 #
-# It behaves like the real CLI: arguments and exit codes are passed through.
-# The only extra thing it does is start the userspace daemon if it is not
-# running yet (set TSU_NO_AUTOSTART=1 to disable that).
+# Arguments and exit codes are passed through unchanged. The only extra thing it
+# does is start the userspace daemon if it is not already running
+# (set TSU_NO_AUTOSTART=1 to disable that).
+#
+# The daemon-already-running case is the hot path for every tailscale command,
+# so it is checked with shell builtins only: no extra processes are spawned.
 
 set -eu
+
+CONFIG_DIR="${TSU_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/tailscale-userspace}"
+CONFIG_FILE="$CONFIG_DIR/config"
 
 resolve_manager() {
 	if [ -n "${TSU_MANAGER:-}" ]; then
@@ -35,10 +41,34 @@ resolve_manager() {
 	printf '%s' "$dir/tailscale-userspace"
 }
 
-MANAGER=$(resolve_manager)
-[ -x "$MANAGER" ] || {
-	printf 'tailscale: error: cannot find tailscale-userspace next to %s\n' "$0" >&2
+if [ ! -f "$CONFIG_FILE" ]; then
+	printf 'tailscale: error: %s not found; run install.sh first\n' "$CONFIG_FILE" >&2
 	exit 1
+fi
+# shellcheck source=/dev/null
+. "$CONFIG_FILE"
+: "${TSU_BIN_DIR:=}"
+: "${TSU_SOCKET:=}"
+: "${TSU_PID_FILE:=}"
+
+if [ -z "$TSU_BIN_DIR" ] || [ ! -x "$TSU_BIN_DIR/tailscale" ]; then
+	printf 'tailscale: error: %s/tailscale is missing; re-run install.sh\n' "${TSU_BIN_DIR:-<unset>}" >&2
+	exit 1
+fi
+
+# Up means the socket exists and, when there is a pid file, that process is
+# still alive.
+daemon_up() {
+	[ -S "$TSU_SOCKET" ] || return 1
+	if [ -n "$TSU_PID_FILE" ] && [ -f "$TSU_PID_FILE" ]; then
+		pid=""
+		read -r pid <"$TSU_PID_FILE" 2>/dev/null || true
+		case "$pid" in
+			'' | *[!0-9]*) return 0 ;;
+			*) kill -0 "$pid" 2>/dev/null || return 1 ;;
+		esac
+	fi
+	return 0
 }
 
 # Commands that do not need a running daemon, and an explicit --socket, should
@@ -53,8 +83,8 @@ for arg in "$@"; do
 	esac
 done
 
-if [ "$needs_daemon" = yes ] && [ "${TSU_NO_AUTOSTART:-0}" != 1 ]; then
-	"$MANAGER" start >/dev/null 2>&1 || true
+if [ "$needs_daemon" = yes ] && [ "${TSU_NO_AUTOSTART:-0}" != 1 ] && ! daemon_up; then
+	"$(resolve_manager)" start >/dev/null 2>&1 || true
 fi
 
-exec "$MANAGER" exec "$@"
+exec "$TSU_BIN_DIR/tailscale" --socket="$TSU_SOCKET" "$@"

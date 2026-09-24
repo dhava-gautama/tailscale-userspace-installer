@@ -99,6 +99,46 @@ check_not "TSU_NO_AUTOSTART=1 leaves the daemon down" "$MANAGER" is-running
 "$SHIM" status >/dev/null 2>&1 || true
 check "wrapper auto-starts the daemon" "$MANAGER" is-running
 
+printf '\n== idempotent re-run ==\n'
+pid_before=$(pgrep -f "socket=$STATE/tailscaled.sock" 2>/dev/null | head -n 1) || true
+if sh "$ROOT/install.sh" --prefix "$PREFIX" --state-dir "$STATE" --no-systemd \
+	--socks5=127.0.0.1:18055 >"$WORK/rerun.log" 2>&1; then
+	ok "re-run with the same version completed"
+else
+	bad "re-run with the same version completed"
+	cat "$WORK/rerun.log" >&2
+fi
+check "re-run reused the installed binaries" grep -q "Reusing the existing Tailscale" "$WORK/rerun.log"
+check_not "re-run did not download the tarball" grep -q "Downloading" "$WORK/rerun.log"
+pid_after=$(pgrep -f "socket=$STATE/tailscaled.sock" 2>/dev/null | head -n 1) || true
+if [ -n "$pid_before" ] && [ "$pid_before" = "$pid_after" ]; then
+	ok "re-run left the running daemon alone (pid $pid_after)"
+else
+	bad "re-run left the running daemon alone ($pid_before -> $pid_after)"
+fi
+
+printf '\n== backend switch ==\n'
+mkdir -p "$XDG_CONFIG_HOME/systemd/user"
+printf '[Unit]\nDescription=stale unit from an earlier install\n' \
+	>"$XDG_CONFIG_HOME/systemd/user/tailscaled-userspace.service"
+sh "$ROOT/install.sh" --prefix "$PREFIX" --state-dir "$STATE" --no-systemd --no-start \
+	--socks5=127.0.0.1:18055 >"$WORK/switch.log" 2>&1 || true
+check_not "a stale systemd unit is removed by --no-systemd" \
+	test -e "$XDG_CONFIG_HOME/systemd/user/tailscaled-userspace.service"
+check "config records the background backend" \
+	grep -q "^TSU_USE_SYSTEMD='no'\$" "$XDG_CONFIG_HOME/tailscale-userspace/config"
+
+printf '\n== argument validation ==\n'
+if out=$(sh "$ROOT/install.sh" --prefix "$PREFIX" --state-dir "$STATE" --no-start \
+	--socks5=nonsense 2>&1); then
+	bad "--socks5 without a port is rejected"
+else
+	case "$out" in
+		*"host:port"*) ok "--socks5 without a port is rejected with a clear message" ;;
+		*) bad "--socks5 without a port gives a clear message (got: $out)" ;;
+	esac
+fi
+
 printf '\n== userspace networking ==\n'
 # A real SOCKS5 greeting (version 5, one method: no-auth) must be answered with
 # 05 00. That proves the userspace netstack is serving, not just that a port is

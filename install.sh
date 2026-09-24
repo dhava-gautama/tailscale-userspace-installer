@@ -100,38 +100,51 @@ place_file() { # src dst mode
 	mv -f "$tmp" "$2"
 }
 
-detect_arch() {
-	case "$(uname -m)" in
-		x86_64 | amd64) echo amd64 ;;
-		aarch64 | arm64) echo arm64 ;;
-		armv7l | armv7 | armv6l | armhf | arm) echo arm ;;
-		i386 | i486 | i586 | i686 | x86) echo 386 ;;
-		riscv64) echo riscv64 ;;
-		mips) echo mips ;;
-		mipsel) echo mipsle ;;
-		mips64) echo mips64 ;;
-		mips64el) echo mips64le ;;
-		*) echo '' ;;
-	esac
-}
-
 normalize_arch() {
 	case "$1" in
 		amd64 | x86_64 | x64) echo amd64 ;;
 		arm64 | aarch64) echo arm64 ;;
-		arm | armv7 | armv7l | armv6l | armhf) echo arm ;;
+		arm | armv6 | armv6l | armv7 | armv7l | armv8l | armhf) echo arm ;;
 		386 | i386 | i486 | i586 | i686 | x86) echo 386 ;;
+		mipsel) echo mipsle ;;
+		mips64el) echo mips64le ;;
 		riscv64 | mips | mipsle | mips64 | mips64le) echo "$1" ;;
 		*) echo '' ;;
 	esac
 }
 
+fetch_url() { # url destination
+	url="$1"
+	dest="$2"
+	set -- -fsSL --retry 3 --retry-delay 2 --retry-connrefused -o "$dest"
+	case "$url" in
+		https://*) set -- "$@" --proto '=https' ;;
+	esac
+	curl "$@" "$url"
+}
+
+fetch_stdout() { # url
+	url="$1"
+	set -- -fsSL --compressed --retry 3 --retry-delay 2 --retry-connrefused
+	case "$url" in
+		https://*) set -- "$@" --proto '=https' ;;
+	esac
+	curl "$@" "$url"
+}
+
 resolve_version() { # track
-	json=$(curl -fsSL "$PKGS_BASE/$1/?mode=json") ||
+	json=$(fetch_stdout "$PKGS_BASE/$1/?mode=json") ||
 		die "cannot reach $PKGS_BASE/$1 (network problem?)"
 	ver=$(printf '%s' "$json" | sed -n 's/.*"TarballsVersion":[[:space:]]*"\([^"]*\)".*/\1/p')
 	[ -n "$ver" ] || die "cannot determine the latest version from $PKGS_BASE/$1"
 	printf '%s' "$ver"
+}
+
+check_value() { # label value
+	case "$2" in
+		*[[:space:]]*) die "$1 may not contain whitespace: $2" ;;
+		*\'*) die "$1 may not contain a single quote: $2" ;;
+	esac
 }
 
 check_path() { # label path
@@ -139,9 +152,14 @@ check_path() { # label path
 		/*) ;;
 		*) die "$1 must be an absolute path: $2" ;;
 	esac
+	check_value "$1" "$2"
+}
+
+check_listener() { # label value; an empty value disables the listener
 	case "$2" in
-		*[[:space:]]*) die "$1 may not contain whitespace: $2" ;;
-		*\'*) die "$1 may not contain a single quote: $2" ;;
+		'') return 0 ;;
+		*:*) check_value "$1" "$2" ;;
+		*) die "$1 must look like host:port, or be empty to disable it (got: $2)" ;;
 	esac
 }
 
@@ -252,9 +270,12 @@ have mktemp || die "mktemp is required"
 
 check_path "--prefix" "$PREFIX"
 check_path "--state-dir" "$STATE_DIR"
+check_listener "--socks5" "$SOCKS5"
+check_listener "--http-proxy" "$HTTP_PROXY"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/tailscale-userspace"
 CONFIG_FILE="$CONFIG_DIR/config"
+UNIT_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/tailscaled-userspace.service"
 BIN_DIR="$PREFIX/libexec/tailscale-userspace"
 SOCKET="$STATE_DIR/tailscaled.sock"
 LOG_FILE="$STATE_DIR/tailscaled.log"
@@ -271,7 +292,7 @@ if [ -n "$ARCH" ]; then
 	ARCH="$(normalize_arch "$ARCH")"
 	[ -n "$ARCH" ] || die "unsupported --arch"
 else
-	ARCH="$(detect_arch)"
+	ARCH="$(normalize_arch "$(uname -m)")"
 	[ -n "$ARCH" ] || die "unsupported machine architecture: $(uname -m) (use --arch)"
 fi
 
@@ -293,30 +314,51 @@ TMP_DIR="$(mktemp -d)"
 cleanup() { [ -n "${TMP_DIR:-}" ] && rm -rf "$TMP_DIR"; }
 trap cleanup EXIT INT TERM HUP
 
-say "Downloading $URL"
-curl -fsSL -o "$TMP_DIR/$TARBALL" "$URL" ||
-	die "download failed: $URL (does version $VERSION exist on the $TRACK track for $ARCH?)"
-
-if curl -fsSL -o "$TMP_DIR/$TARBALL.sha256" "$URL.sha256" 2>/dev/null; then
-	want=$(sed -n 's/^\([0-9a-fA-F]\{64\}\).*/\1/p' "$TMP_DIR/$TARBALL.sha256" | head -n 1 | tr 'A-F' 'a-f')
-	got=$(sha256_of "$TMP_DIR/$TARBALL" | tr 'A-F' 'a-f')
-	if [ -z "$want" ]; then
-		warn "could not parse $TARBALL.sha256, skipping checksum verification"
-	elif [ -z "$got" ]; then
-		warn "no sha256 tool found, skipping checksum verification"
-	elif [ "$want" != "$got" ]; then
-		die "checksum mismatch for $TARBALL
-  expected $want
-  got      $got"
-	else
-		say "Checksum verified (sha256 $got)"
+# An existing install of this exact version was checksum-verified when it was
+# first unpacked, so do not download and unpack it again just to land in the
+# same place.
+REUSE=no
+if [ -x "$VERSION_DIR/tailscaled" ] && [ -x "$VERSION_DIR/tailscale" ]; then
+	if "$VERSION_DIR/tailscaled" --version 2>/dev/null | head -n 1 | grep -qx "$VERSION"; then
+		REUSE=yes
+		say "Reusing the existing Tailscale $VERSION install in $VERSION_DIR"
 	fi
-else
-	warn "no checksum published at $URL.sha256, skipping verification"
 fi
 
-tar -xzf "$TMP_DIR/$TARBALL" -C "$TMP_DIR" "$TAR_DIR/tailscale" "$TAR_DIR/tailscaled" ||
-	die "could not extract $TARBALL"
+if [ "$REUSE" = no ]; then
+	say "Downloading $URL"
+	fetch_url "$URL" "$TMP_DIR/$TARBALL" ||
+		die "download failed: $URL (does version $VERSION exist on the $TRACK track for $ARCH?)"
+
+	if fetch_url "$URL.sha256" "$TMP_DIR/$TARBALL.sha256" 2>/dev/null; then
+		want=$(sed -n 's/^\([0-9a-fA-F]\{64\}\).*/\1/p' "$TMP_DIR/$TARBALL.sha256" | head -n 1 | tr 'A-F' 'a-f')
+		got=$(sha256_of "$TMP_DIR/$TARBALL" | tr 'A-F' 'a-f')
+		if [ -z "$want" ]; then
+			warn "could not parse $TARBALL.sha256, skipping checksum verification"
+		elif [ -z "$got" ]; then
+			warn "no sha256 tool found, skipping checksum verification"
+		elif [ "$want" != "$got" ]; then
+			die "checksum mismatch for $TARBALL
+  expected $want
+  got      $got"
+		else
+			say "Checksum verified (sha256 $got)"
+		fi
+	else
+		warn "no checksum published at $URL.sha256, skipping verification"
+	fi
+
+	tar -xzf "$TMP_DIR/$TARBALL" -C "$TMP_DIR" "$TAR_DIR/tailscale" "$TAR_DIR/tailscaled" ||
+		die "could not extract $TARBALL"
+
+	# Catch a wrong --arch here, with a clear message, rather than letting the
+	# daemon fail to start later.
+	got_ver=$("$TMP_DIR/$TAR_DIR/tailscaled" --version 2>/dev/null | head -n 1) || got_ver=""
+	if [ "$got_ver" != "$VERSION" ]; then
+		die "the downloaded tailscaled reports version '${got_ver:-none}', expected $VERSION
+  (is --arch $ARCH right for this machine?)"
+	fi
+fi
 
 # ---------------------------------------------------------------- install
 
@@ -324,8 +366,10 @@ say "Installing Tailscale $VERSION ($ARCH) into $VERSION_DIR"
 mkdir -p "$VERSION_DIR" "$PREFIX/bin" "$STATE_DIR" "$CONFIG_DIR"
 chmod 700 "$STATE_DIR" 2>/dev/null || true
 
-place_file "$TMP_DIR/$TAR_DIR/tailscale" "$VERSION_DIR/tailscale" 0755
-place_file "$TMP_DIR/$TAR_DIR/tailscaled" "$VERSION_DIR/tailscaled" 0755
+if [ "$REUSE" = no ]; then
+	place_file "$TMP_DIR/$TAR_DIR/tailscale" "$VERSION_DIR/tailscale" 0755
+	place_file "$TMP_DIR/$TAR_DIR/tailscaled" "$VERSION_DIR/tailscaled" 0755
+fi
 ln -sfn "$VERSION" "$BIN_DIR/current"
 
 # The manager and the `tailscale` wrapper come from this repo. When install.sh
@@ -339,7 +383,7 @@ fetch_asset() { # repo path, destination, mode
 	if [ -n "$LOCAL_DIR" ] && [ -f "$LOCAL_DIR/$1" ]; then
 		place_file "$LOCAL_DIR/$1" "$2" "$3"
 	else
-		curl -fsSL -o "$TMP_DIR/asset" "$ASSET_BASE/$1" ||
+		fetch_url "$ASSET_BASE/$1" "$TMP_DIR/asset" ||
 			die "could not download $ASSET_BASE/$1"
 		place_file "$TMP_DIR/asset" "$2" "$3"
 	fi
@@ -352,6 +396,23 @@ if [ "$INSTALL_SHIM" = yes ]; then
   (re-run with --no-shim if you meant to keep it)"
 	fi
 	fetch_asset "bin/tailscale" "$PREFIX/bin/tailscale" 0755
+fi
+
+# What the daemon was started with, so an unchanged re-run can leave it running
+# instead of dropping every live tailnet connection.
+OLD_BIN_DIR=""
+OLD_SOCKS5=""
+OLD_HTTP_PROXY=""
+OLD_STATE_DIR=""
+OLD_USE_SYSTEMD=""
+if [ -f "$CONFIG_FILE" ]; then
+	# shellcheck source=/dev/null
+	. "$CONFIG_FILE"
+	OLD_BIN_DIR="${TSU_BIN_DIR:-}"
+	OLD_SOCKS5="${TSU_SOCKS5:-}"
+	OLD_HTTP_PROXY="${TSU_HTTP_PROXY:-}"
+	OLD_STATE_DIR="${TSU_STATE_DIR:-}"
+	OLD_USE_SYSTEMD="${TSU_USE_SYSTEMD:-}"
 fi
 
 {
@@ -370,10 +431,34 @@ fi
 
 say "Wrote $CONFIG_FILE"
 
+# Switching away from the systemd backend: a left-over unit would keep a daemon
+# alive, fight the background one for the socket, and Restart=on-failure would
+# revive it.
+if [ "$USE_SYSTEMD" = no ] && [ -f "$UNIT_FILE" ]; then
+	if have systemctl && [ -d /run/systemd/system ]; then
+		systemctl --user disable --now tailscaled-userspace.service 2>/dev/null || true
+	fi
+	rm -f "$UNIT_FILE"
+	say "Removed the systemd user unit (--no-systemd)."
+fi
+
 # ---------------------------------------------------------------- start
+
+DAEMON_SETTINGS_CHANGED=no
+if [ "$OLD_BIN_DIR" != "$VERSION_DIR" ] ||
+	[ "$OLD_SOCKS5" != "$SOCKS5" ] ||
+	[ "$OLD_HTTP_PROXY" != "$HTTP_PROXY" ] ||
+	[ "$OLD_STATE_DIR" != "$STATE_DIR" ] ||
+	[ "$OLD_USE_SYSTEMD" != "$USE_SYSTEMD" ]; then
+	DAEMON_SETTINGS_CHANGED=yes
+fi
 
 if [ "$DO_START" = no ]; then
 	say "Skipping daemon start (--no-start). Start it later with: $MANAGER start"
+elif [ "$DAEMON_SETTINGS_CHANGED" = no ] && "$MANAGER" is-running >/dev/null 2>&1; then
+	# Refresh the systemd unit if it drifted, but leave the daemon running.
+	"$MANAGER" start >/dev/null 2>&1 || true
+	say "Daemon already running with the same settings; left it alone."
 else
 	say "Starting the userspace daemon..."
 	"$MANAGER" restart || die "the daemon failed to start; check: $MANAGER logs"
