@@ -26,6 +26,28 @@ tailscale up --ssh
 tailscale ssh my-other-box
 ```
 
+### Optional: tailcat, the control-plane-free companion
+
+[Tailcat](https://github.com/tailscale/tailcat) is Tailscale's netcat-like tool:
+point-to-point WireGuard-encrypted pipes and port forwards with **no account, no
+tailnet, no daemon and no root**. It shares this project's philosophy — pure
+userspace, static binary — and installs alongside with `--tailcat`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dhava-gautama/tailscale-userspace-installer/main/install.sh \
+  | sh -s -- --tailcat
+
+tailcat                       # prints a tc... address, waits
+echo hello | tailcat <tc...>  # from the other machine, via the address
+tailcat serve 8080            # expose a local port through the tunnel
+tailcat forward <tc...> 18080:8080   # make it an ordinary local port
+```
+
+Note what tailcat is **not**: it does not join your tailnet. Connections are made by
+exchanging the `tc...` capability address out of band, so it complements tailscale
+(handy for one-off transfers with someone outside your tailnet) rather than replacing
+it. See `install-tailcat.sh --help` for standalone use.
+
 ## How it works
 
 The official installer unpacks packages, writes to `/usr/bin`, and registers a root
@@ -62,6 +84,7 @@ Nothing is written outside your home directory. No command uses `sudo`.
 | `--socks5 ADDR`, `--http-proxy ADDR` | proxy listeners as `host:port` (default `127.0.0.1:1055`; pass `--socks5=` to disable) |
 | `--auth-key KEY` | join the tailnet during install (also read from `$TS_AUTHKEY` or `$TS_AUTH_KEY`) |
 | `--shim` / `--no-shim` | install the `tailscale` wrapper (default: yes) |
+| `--tailcat` / `--no-tailcat` | also install [tailcat](https://github.com/tailscale/tailcat), Tailscale's control-plane-free netcat (default: no; pin with `TSU_TAILCAT_VERSION=v0.7.0`) |
 | `--systemd` / `--no-systemd` | use a systemd user unit when available (default: auto) |
 | `--linger` / `--no-linger` | try to enable systemd user lingering so the daemon starts at boot |
 | `--no-start`, `--no-up` | install only; do not start the daemon / do not join |
@@ -165,6 +188,10 @@ Measured, not assumed (see `tests/smoke.sh`, run with the static 1.102.4 build):
 - `nc -X 5 -x 127.0.0.1:1055 <node>.tailnet.ts.net 22` completes a SOCKS5 handshake,
   resolves the MagicDNS name and reaches the node's Tailscale SSH server
   (`SSH-2.0-Tailscale` banner)
+- with `--tailcat` (or standalone `install-tailcat.sh`): the tailcat binary installs with
+  its release checksum verified, a re-run reuses it, and two local tailcat processes
+  deliver a payload end-to-end over the data plane; `uninstall` removes it only when the
+  `bin/tailcat` symlink points into this install's tree
 - the systemd user unit path is implemented but was not exercised on the test host,
   which has no user systemd session; that host falls back to a background process
 
@@ -208,6 +235,7 @@ it detects either situation.
 
 ```
 install.sh                     the installer (curl | sh)
+install-tailcat.sh             optional tailcat installer (also run by --tailcat)
 bin/tailscale-userspace        daemon manager: start/stop/up/env/uninstall
 bin/tailscale                  the CLI wrapper (auto-starts the daemon)
 tests/smoke.sh                 end-to-end test in a throwaway prefix
@@ -217,7 +245,9 @@ Runtime layout after install:
 
 ```
 ~/.local/bin/tailscale                        wrapper (and tailscale-userspace)
+~/.local/bin/tailcat                          only with --tailcat
 ~/.local/libexec/tailscale-userspace/<ver>/   official static binaries
+~/.local/libexec/tailscale-userspace/tailcat/<tag>/   tailcat, only with --tailcat
 ~/.local/state/tailscale-userspace/           node key, state, socket, log
 ~/.config/tailscale-userspace/config          settings written by install.sh
 ~/.config/systemd/user/tailscaled-userspace.service   only when systemd is used

@@ -221,10 +221,68 @@ check "install accepts --socks5= (disabled)" sh "$ROOT/install.sh" \
 check "config records the disabled proxy" \
 	grep -q "^TSU_SOCKS5=''\$" "$XDG_CONFIG_HOME/tailscale-userspace/config"
 
+printf '\n== tailcat ==\n'
+# Requires network access to github.com; fails loudly when offline.
+TCBIN="$PREFIX/bin/tailcat"
+tailcat_symlink_ok() {
+	[ "$(readlink "$TCBIN")" = "$PREFIX/libexec/tailscale-userspace/tailcat/current/tailcat" ]
+}
+tailcat_rerun_reuses() {
+	sh "$ROOT/install-tailcat.sh" --prefix "$PREFIX" 2>&1 | grep -q Reusing
+}
+if sh "$ROOT/install-tailcat.sh" --prefix "$PREFIX" --quiet >"$WORK/tailcat.log" 2>&1; then
+	check "tailcat binary installed" test -x "$TCBIN"
+	check "tailcat --version reports the tag" sh -c "\"$TCBIN\" --version | grep -q '^v[0-9]'"
+	check "symlink points into the libexec tree" tailcat_symlink_ok
+
+	# Local end-to-end pipe: server prints a tc... address, client connects.
+	TCADDR_LOG="$WORK/tailcat-addr.log"
+	"$TCBIN" >"$TCADDR_LOG" 2>&1 &
+	tc_srv=$!
+	tc_addr=""
+	tc_i=0
+	while [ "$tc_i" -lt 100 ]; do
+		tc_addr=$(grep -oE 'tc[A-Za-z0-9_-]{20,}' "$TCADDR_LOG" 2>/dev/null | head -n 1)
+		[ -n "$tc_addr" ] && break
+		kill -0 "$tc_srv" 2>/dev/null || break
+		sleep 0.2
+		tc_i=$((tc_i + 1))
+	done
+	if [ -n "$tc_addr" ]; then
+		if printf 'smoke test payload\n' | timeout 60 "$TCBIN" "$tc_addr" >"$WORK/tailcat-client.log" 2>&1; then
+			wait "$tc_srv"
+			if grep -q 'smoke test payload' "$TCADDR_LOG"; then
+				ok "tailcat end-to-end pipe delivered the payload"
+			else
+				bad "tailcat end-to-end pipe delivered the payload"
+			fi
+		else
+			kill "$tc_srv" 2>/dev/null || true
+			bad "tailcat client connected to the local server"
+		fi
+	else
+		kill "$tc_srv" 2>/dev/null || true
+		printf 'skip tailcat pipe (no address within 20s; offline?)\n'
+	fi
+
+	check "tailcat re-run reuses the install" tailcat_rerun_reuses
+	# Reinstall so the final uninstall checks have a full install to remove;
+	# the uninstall check above runs a plain `uninstall`, which keeps state.
+	sh "$ROOT/install-tailcat.sh" --prefix "$PREFIX" --quiet >/dev/null 2>&1
+	sh "$ROOT/install.sh" --prefix "$PREFIX" --state-dir "$STATE" --no-systemd \
+		--socks5=127.0.0.1:18055 --no-start >/dev/null 2>&1
+	check "manager reinstalled for final checks" test -x "$MANAGER"
+else
+	bad "install-tailcat.sh completed"
+	cat "$WORK/tailcat.log" >&2
+fi
+
 printf '\n== uninstall ==\n'
 check "uninstall --purge works" "$MANAGER" uninstall --purge
 check_not "manager removed" test -e "$MANAGER"
 check_not "wrapper removed" test -e "$SHIM"
+check_not "tailcat symlink removed" test -e "$TCBIN"
+check_not "tailcat tree removed" test -e "$PREFIX/libexec/tailscale-userspace/tailcat"
 check_not "state directory removed" test -e "$STATE"
 check_not "config removed" test -e "$XDG_CONFIG_HOME/tailscale-userspace/config"
 

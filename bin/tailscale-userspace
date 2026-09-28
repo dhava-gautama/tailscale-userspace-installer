@@ -427,8 +427,14 @@ cmd_uninstall() {
 		printf 'Removed %s\n' "$UNIT_FILE"
 	fi
 
-	for f in "$TSU_PREFIX/bin/tailscale" "$TSU_PREFIX/bin/tailscale-userspace"; do
-		if [ -e "$f" ]; then
+	for f in "$TSU_PREFIX/bin/tailscale" "$TSU_PREFIX/bin/tailscale-userspace" \
+		"$TSU_PREFIX/bin/tailcat"; do
+		# Only remove the symlink if it points into our libexec tree; a tailcat
+		# installed by another method must not be destroyed.
+		if [ -L "$f" ] && [ "$(readlink "$f" 2>/dev/null || true)" = "$TSU_PREFIX/libexec/tailscale-userspace/tailcat/current/tailcat" ]; then
+			rm -f "$f"
+			printf 'Removed %s\n' "$f"
+		elif [ -e "$f" ] && [ "$f" != "$TSU_PREFIX/bin/tailcat" ]; then
 			rm -f "$f"
 			printf 'Removed %s\n' "$f"
 		fi

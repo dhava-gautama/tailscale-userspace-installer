@@ -45,6 +45,12 @@ Installer flags:
   --auth-key KEY      tailnet auth key; also read from $TS_AUTHKEY / $TS_AUTH_KEY
   --shim / --no-shim  install the `tailscale` wrapper that auto-starts the daemon
                       (default: install it)
+  --tailcat / --no-tailcat
+                      also install tailcat, Tailscale's control-plane-free netcat
+                      (default: skip it; see install-tailcat.sh --help)
+  --tailcat / --no-tailcat
+                      also install tailcat, Tailscale's control-plane-free netcat
+                      (default: skip it; see install-tailcat.sh --help)
   --systemd / --no-systemd
                       use a systemd user service when available (default: auto)
   --linger / --no-linger
@@ -175,8 +181,10 @@ TRACK="stable"
 ARCH=""
 SOCKS5="127.0.0.1:1055"
 HTTP_PROXY=""
+TC_VERSION="${TSU_TAILCAT_VERSION:-}"
 AUTH_KEY="${TS_AUTHKEY:-${TS_AUTH_KEY:-}}"
 INSTALL_SHIM=yes
+INSTALL_TAILCAT=no
 USE_SYSTEMD=auto
 DO_LINGER=auto
 DO_START=yes
@@ -232,6 +240,8 @@ while [ $# -gt 0 ]; do
 		--auth-key) AUTH_KEY="$optval" ;;
 		--shim) INSTALL_SHIM=yes ;;
 		--no-shim) INSTALL_SHIM=no ;;
+		--tailcat) INSTALL_TAILCAT=yes ;;
+		--no-tailcat) INSTALL_TAILCAT=no ;;
 		--systemd) USE_SYSTEMD=yes ;;
 		--no-systemd) USE_SYSTEMD=no ;;
 		--linger) DO_LINGER=yes ;;
@@ -403,6 +413,26 @@ if [ "$INSTALL_SHIM" = yes ]; then
   (re-run with --no-shim if you meant to keep it)"
 	fi
 	fetch_asset "bin/tailscale" "$PREFIX/bin/tailscale" 0755
+fi
+
+# Optional companion: tailcat, Tailscale's control-plane-free netcat. It needs
+# no account and no daemon; see install-tailcat.sh.
+if [ "$INSTALL_TAILCAT" = yes ]; then
+	TC_INSTALLER="$LOCAL_DIR/install-tailcat.sh"
+	if [ -z "$LOCAL_DIR" ]; then
+		TC_INSTALLER="$TMP_DIR/install-tailcat.sh"
+		fetch_url "$ASSET_BASE/install-tailcat.sh" "$TC_INSTALLER" ||
+			die "could not download $ASSET_BASE/install-tailcat.sh"
+	fi
+	set -- --prefix="$PREFIX"
+	if [ "$QUIET" = yes ]; then
+		set -- "$@" --quiet
+	fi
+	if [ -n "$TC_VERSION" ]; then
+		set -- "$@" --version="$TC_VERSION"
+	fi
+	sh "$TC_INSTALLER" "$@" ||
+		die "tailcat installation failed (continue without it: --no-tailcat)"
 fi
 
 # What the daemon was started with, so an unchanged re-run can leave it running
